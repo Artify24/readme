@@ -327,8 +327,7 @@ ProposedAction(tool_name, arguments, reasoning)
      v
 GovernanceEngine.evaluate(action, context)
      |
-     +-- IdentityValidator        (Active: JWT / API key / session validation)
-     +-- PermissionValidator      (Active: RBAC / scope checking)
+     +-- ToolScopeValidator       <- Enforces optional caller-level allowed_tools restriction
      +-- ToolAuthorizationValidator  <- Enforces Layer 1 allowlist at execution time
      +-- ToolArgumentValidator    <- Sanitizes tool input parameters
      |
@@ -336,37 +335,20 @@ GovernanceEngine.evaluate(action, context)
      +-- APPROVED --> Layer 3 execution
 ```
 
-### 5.2 IdentityValidator (Active)
+### 5.2 ToolScopeValidator (Active)
 
-Performs per-request authentication checks against execution context metadata:
+Performs caller-level tool restrictions:
+- Developers can pass an explicit `allowed_tools` list on `agent.run(prompt, allowed_tools=["db_query"])`.
+- At execution time, `ToolScopeValidator` verifies that the proposed tool call exists within the caller's restricted tool set.
+- Clean, non-intrusive scope enforcement without requiring complex authentication or RBAC frameworks inside the SDK.
 
-- **JWT Decoding & Verification**: Reads `jwt`/`token`/`auth_token` from `context.metadata` or `context.request.metadata`. If `AEGIS_JWT_SECRET` or `JWT_SECRET` is set, verifies signature and expiration. Stores decoded payload in `context.state["jwt_payload"]` for downstream `PermissionValidator`.
-- **API Key Inspection**: Reads `api_key`/`x_api_key`. Validates format and minimum length (≥8 chars).
-- **Explicit Unauthenticated Flag**: If `authenticated: False` is passed in metadata, blocks execution.
-- **Strict Auth Enforcement**: When `require_auth`, `strict_auth` (via metadata), or `AEGIS_REQUIRE_AUTH=true` (env), blocks execution if no verified identity, JWT, or API key is present.
-
-### 5.3 PermissionValidator (Active)
-
-Performs RBAC and scope-based authorization:
-
-- **Role Extraction**: Reads `roles`, `role`, `user_role` from both `context.metadata` and decoded JWT payload.
-- **Role-Based Restrictions**: `readonly` and `guest` roles are denied mutating operations (any tool containing: `create`, `insert`, `update`, `delete`, `drop`, `backup`, `restore`, `send`, `write`, `modify`).
-- **Scope Verification**: Reads `permissions` or `scopes` and validates against required scope:
-  - `db_*` tools → `db:read` / `db:write`
-  - `github_*` tools → `github:read` / `github:write`
-  - `email_*` tools → `email:read` / `email:write`
-  - Other tools → `{tool_name}:execute`
-- **Wildcard Access**: `*`, `admin`, or `all` permissions bypass scope checks.
-- **Strict RBAC Enforcement**: When `require_rbac` or `AEGIS_REQUIRE_RBAC=true`, rejects execution if no permissions or roles are present.
-
-### 5.4 Identity and Permission Validators
+### 5.3 Layer 2 Validators Summary
 
 | Validator | Function | Implementation |
 |---|---|---|
-| `IdentityValidator` | JWT / API Key / Session Authentication | Decodes and validates JWT signatures/expiration, inspects API keys, and enforces strict authentication flags (`require_auth`) |
-| `PermissionValidator` | RBAC & Scope Authorization | Enforces caller role restrictions (e.g. `readonly`/`guest` denied on mutating tools like `db_insert`, `email_send`) and verifies required scopes (`db:write`, `github:read`, etc.) |
-
-Layer 2 validates caller identity and authorization scopes prior to executing any proposed tool action.
+| `ToolScopeValidator` | Per-call Tool Restriction | Enforces optional developer-provided `allowed_tools` list passed to `agent.run()` |
+| `ToolAuthorizationValidator` | Layer 1 Allowlist Enforcement | Enforces Layer 1 least-privilege tool allowlist at execution time |
+| `ToolArgumentValidator` | Parameter Sanitization | Prevents SQL injection, path traversal, malformed JSON, and command injection in tool inputs |
 
 ### 5.5 ToolAuthorizationValidator (Active)
 
@@ -804,10 +786,9 @@ This configuration allows **any origin** to make credentialed cross-origin reque
    |   +-- Creates ProposedAction(tool_name="github_read_prs", arguments={...})
    |   |
    |   +-- [LAYER 2] GovernanceEngine.evaluate(action, context)
-   |   +-- IdentityValidator.validate()   -> PASS (JWT / API Key / session verified)
-   |   +-- PermissionValidator.validate() -> PASS (RBAC & Scope checked)
-   |   +-- ToolAuthorizationValidator.validate() -> PASS (in allowed_tools)
-   |   +-- ToolArgumentValidator.validate() -> PASS (clean args)
+   |   +-- ToolScopeValidator.validate()        -> PASS (in caller allowed_tools if specified)
+   |   +-- ToolAuthorizationValidator.validate() -> PASS (in Layer 1 allowed_tools)
+   |   +-- ToolArgumentValidator.validate()     -> PASS (clean args)
    |   |
    |   +-- [LAYER 3] TimeoutManager.execute_with_timeout(executor.execute, 30s)
    |       +-- RetryManager.execute_with_retry(timed_execution, "exponential")
@@ -844,7 +825,7 @@ This section is the **honest assessment** for security reviewers.
 
 | # | Issue | Location | Impact |
 |---|---|---|---|
-| C1 | Layer 2 Identity & Permission Validation | `layer2/validators.py` | ✅ IMPLEMENTED: Validates JWTs, API keys, session auth, RBAC roles (`readonly`/`guest`), and scope requirements |
+| C1 | Layer 2 Tool Scope Validation | `layer2/validators.py` | ✅ IMPLEMENTED: Enforces optional developer-provided `allowed_tools` per request |
 | C2 | HITL approval is a string match on user input — no cryptographic binding | `kernel.py` | Attacker who can inject "I approve" as the prompt bypasses HITL |
 | C3 | Wildcard CORS with credentials enabled on backend | `backend/app/main.py` | CSRF risk; any website can make credentialed requests |
 | C4 | Memory Poisoning Detection | `memory_validation.py` | ✅ IMPLEMENTED: Enforces 10k context size limits, pattern-based injection detection, and LLM semantic scan for state hijacking |
@@ -920,8 +901,7 @@ Utilities:
 
 | Priority | Item | Complexity | Status |
 |---|---|---|---|
-| P0 | Implement `IdentityValidator` with real JWT/session verification | Medium | ✅ Done |
-| P0 | Implement `PermissionValidator` with RBAC scope checking | Medium | ✅ Done |
+| P0 | Implement `ToolScopeValidator` for caller-level tool restrictions | Low | ✅ Done |
 | P0 | Restrict CORS to known origins in backend | Low | Pending |
 | P1 | Semantic memory poisoning scan in `MemoryValidationStage` | High | ✅ Done |
 | P1 | Cryptographic or session-bound HITL approval tokens | High | Pending |
@@ -952,15 +932,13 @@ async def main():
     )
 
     async with agent:
-        result = await agent.run(
-            "List all open PRs",
-            metadata={
-                "jwt": "eyJhbGc...",           # JWT token for IdentityValidator
-                "permissions": ["github:read"], # RBAC scopes for PermissionValidator
-                "user_id": "user-123"
-            }
-        )
+        # Standard call
+        result = await agent.run("List all open PRs")
         print(result.output)
+
+        # Restrict tool scope per-call (e.g. for a read-only caller)
+        read_only_result = await agent.run("List all open PRs", allowed_tools=["github_list_prs"])
+        print(read_only_result.output)
 ```
 
 ---
