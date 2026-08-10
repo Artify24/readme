@@ -1,0 +1,15 @@
+python-dotenv
+langchain-groq
+pydantic
+langgraph
+langchain-core
+pyrefly
+pytest
+pytest-asyncio
+streamlit
+PyGithub
+supabase
+crewai 
+crewai-tools
+youtube-transcript-api
+
