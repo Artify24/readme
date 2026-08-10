@@ -12,4 +12,4 @@ supabase
 crewai 
 crewai-tools
 youtube-transcript-api
-
+dotenv
